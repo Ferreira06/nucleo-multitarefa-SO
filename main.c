@@ -1,36 +1,76 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "nucleo.h"
+#include "semaforo.h"
 
-//Codigo genérico gerado com IA para testar o nucleo criado
+#define MAX_PROCESSOS 10
 
-// Processo de Teste 1
-void processo_a(void) {
-    for(int i = 0; i < 5; i++) {
-        printf("Processo A executando - Passo %d\n", i);
-        yield(); // Pausa o Processo A e passa a CPU para o próximo
-    }
+
+int buffer[MAX_PROCESSOS];
+
+int in = 0;
+int out = 0;
+
+semaforo mutex;
+semaforo cheio;
+semaforo vazio;
+
+void depositar(int item){
+    buffer[in] = item;
+    printf("[PRODUTOR] - Escrevendo a mensagem %d, no indice: %d\n", buffer[in], in);
+    in = (in+1) % MAX_PROCESSOS;
 }
 
-// Processo de Teste 2
-void processo_b(void) {
-    for(int i = 0; i < 5; i++) {
-        printf("\tProcesso B executando - Passo %d\n", i);
-        yield(); // Pausa o Processo B e passa a CPU para o próximo
-    }
+void retirar(){
+    printf("\t[CONSUMIDOR] - Lendo a mensagem %d, no indice: %d\n", buffer[out], out);
+    buffer[out] = 0;
+    out = (out+1) % MAX_PROCESSOS;
 }
+
+void Produtor(){
+    int limite = 1; //Limite opcional, apenas para demonstração da funcionalidade
+
+    while(limite < 20){
+        P(&vazio);
+        P(&mutex);
+        depositar(limite);
+        V(&mutex);
+        V(&cheio);
+
+        limite++;
+    }
+        yield();
+}
+
+void Consumidor(){
+    int limite = 1; //Limite opcional, apenas para demonstração da funcionalidade
+
+    while(limite < 20){
+        P(&cheio);
+        P(&mutex);
+        retirar();
+        V(&mutex);
+        V(&vazio);
+
+        limite++;
+    }
+        yield();
+}
+
 
 int main(void) {
     printf("--- INICIANDO TESTE DO NUCLEO MULTITAREFAS ---\n\n");
 
-    // 1. Prepara a infraestrutura
     inicia_fila_prontos();
+    inicia_semaforo(&vazio, MAX_PROCESSOS);
+    inicia_semaforo(&cheio, 0);
+    inicia_semaforo(&mutex, 1);
 
-    // 2. Cria os processos na memória
-    cria_processo(processo_a, "Tarefa A");
-    cria_processo(processo_b, "Tarefa B");
+    cria_processo(Produtor, "Produtor");
+    cria_processo(Consumidor, "Consumidor");
 
-    // 3. Dá a partida no motor cooperativo
+
     dispara_sistema();
 
     // 4. O código só chega aqui quando o processo_a e processo_b terminarem
