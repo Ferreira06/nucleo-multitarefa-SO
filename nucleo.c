@@ -3,83 +3,161 @@
 #include <string.h>
 #include "nucleo.h"
 
-BCP tabela_processos[MAX_PROCESSOS];
+/* Instanciação das variáveis reais de rastreamento da fila circular */
+PTR_DESC_PROC prim = NULL;
+PTR_DESC_PROC atual = NULL;
 
-int fila_prontos[MAX_PROCESSOS];
-int inicio_fila = 0;
-int fim_fila = 0;
-int qtd_prontos = 0;
+/* Contexto isolado para a função main do Windows (suporte do módulo system.c) */
+static descritor main_desc;
+static PTR_DESC main_ctx = &main_desc;
+static int main_ready = 0;
 
-BCP* processo_atual = NULL;
+static void processo_trampolim(void *arg) {
+    PTR_DESC_PROC proc = (PTR_DESC_PROC)arg;
 
-void inicia_fila_prontos(){
-    for(int i=0;i<MAX_PROCESSOS;i++){
-        tabela_processos[i].id = i;
-        tabela_processos[i].estado = ESTADO_LIVRE;
-        tabela_processos[i].contexto = NULL;
+    if (proc && proc->codigo) {
+        // Executa a função lógica real do usuário
+        proc->codigo();
     }
 
+    // Se a função do usuário terminar, invoca o encerramento automático
+    termina_processo();
+}
+
+
+void inicia_fila_prontos(){
+    prim = NULL;
+    atual = NULL;
+    main_ready = 0;
     printf("[NUCLEO] Fila circular iniciada!\n\n");
 }
 
-int cria_processo(void (*tarefa)(void), char* nome){
-    int id_livre = -1;
+PTR_DESC_PROC proximo_ativo_depois(PTR_DESC_PROC a_partir){
+    if(prim == NULL) return NULL;
+    if(a_partir == NULL) a_partir = prim;
 
-    //busca pelo proximo ESTADO_LIVRE
-    for(int i=0;i<MAX_PROCESSOS;i++){
-        if(tabela_processos[i].estado == ESTADO_LIVRE){
-            id_livre = i;
-            break;
-        }
+    PTR_DESC_PROC aux = a_partir->prox_desc;
+
+    while(aux != a_partir){
+        if(aux->estado == ATIVO) return aux;
+        aux = aux->prox_desc;
     }
 
-    // caso esteja lotado, sem slots livres
-    if(id_livre == -1){
-        printf("ERRO! Limite de processos atingido. Nao foi possivel criar: %s\n", nome);
+    //Se rodou a lista toda, verifica se o inicial já era um ativo, devolvendo ele mesmo
+    if(a_partir->estado == ATIVO) return a_partir;
+
+    return NULL;
+}
+
+void yield(){
+    if(atual == NULL) return;
+
+    PTR_DESC_PROC prox = proximo_ativo_depois(atual);
+    if(prox != NULL && atual != prox) {
+        PTR_DESC_PROC antigo = atual;
+        atual = prox;
+        transfer(antigo->contexto, atual->contexto);
+    }
+}
+
+
+
+int cria_processo(void (*tarefa)(void), char* nome){
+    PTR_DESC_PROC novo = (PTR_DESC_PROC)malloc(sizeof(BCP));
+    if (novo == NULL) {
+        printf("ERRO! Falha de memoria ao alocar o BCP de: %s\n", nome);
         return -1;
     }
 
-    //atualiza o estado do processo
-    tabela_processos[id_livre].estado = ESTADO_PRONTO;
-
-    strcpy(tabela_processos[id_livre].nome, nome);
-
-    tabela_processos[id_livre].contexto = (PTR_DESC)malloc(sizeof(descritor));
-    if (tabela_processos[id_livre].contexto == NULL) {
-        printf("ERRO! Falha de memoria ao criar o contexto de: %s\n", nome);
+    /* Inicializa os campos internos do descritor */
+    strncpy(novo->nome, nome, 29);
+    novo->nome[29] = '\0';
+    novo->estado = ATIVO;
+    novo->codigo = tarefa;
+    novo->fila_sem = NULL;
+    novo->contexto = cria_desc();
+    if (novo->contexto == NULL) {
+        printf("ERRO! Falha ao criar o contexto fisico de: %s\n", nome);
+        free(novo);
         return -1;
     }
 
     //inicializa a fiber
-    newprocess((proc_fn)tarefa, NULL, tabela_processos[id_livre].contexto);
+    newprocess(processo_trampolim, novo, novo->contexto);
 
-    fila_prontos[fim_fila] = id_livre;
+    /* Encadeamento na Fila Circular */
+    if (prim == NULL) {
+        prim = novo;
+        novo->prox_desc = prim; /* Aponta para si mesmo para fechar o círculo */
+    } else {
+        PTR_DESC_PROC aux = prim;
+        /* Encontra o último elemento atual da fila circular */
+        while (aux->prox_desc != prim) {
+            aux = aux->prox_desc;
+        }
+        /* Insere o novo nó no fim e reestabelece o fechamento do círculo */
+        aux->prox_desc = novo;
+        novo->prox_desc = prim;
+    }
 
-    fim_fila = (fim_fila + 1) % MAX_PROCESSOS;
-    qtd_prontos++;
-
-    printf("[NUCLEO] Processo %s alocado com sucesso (ID: %d) e enviado ao fim da fila!\n", nome, id_livre);
-    return id_livre;
+    printf("[NUCLEO] Processo %s alocado com sucesso e enviado ao fim da fila!\n", nome);
+    return 0;
 }
 
-void termina_processo() {
 
-    if (processo_atual == NULL) {
+void dispara_sistema(){
+    if(prim == NULL) {
+        printf("[NUCLEO] ERRO: Nenhum processo na fila para ser disparado.\n");
         return;
     }
 
-    printf("[NUCLEO] Processo %s solicitou finalizacao!\n", processo_atual->nome);
+    system_init_main(main_ctx);
+    main_ready = 1;
 
-    //atualiza o estado do processo
-    processo_atual->estado = ESTADO_TERMINADO;
+    atual = prim->estado == ATIVO ? prim : proximo_ativo_depois(prim);
 
-    if (processo_atual->contexto != NULL) {
-        free(processo_atual->contexto);
-        processo_atual->contexto = NULL;
+    if(atual != NULL){
+        printf("[NUCLEO] Disparando o Sistema! Passando CPU para o processo: %s\n\n", atual->nome);
+        transfer(main_ctx, atual->contexto);
+    }else{
+        printf("[NUCLEO] ERRO: Nnehum processo ativo encontrado para disparar o sistema.\n");
+    }
+}
+
+
+void termina_processo() {
+
+    if (atual == NULL) {
+        return;
     }
 
-    processo_atual->estado = ESTADO_LIVRE;
+    printf("[NUCLEO] Processo %s solicitou finalizacao!\n", atual->nome);
 
-    extern void processo_trampolim();
-    processo_trampolim();
+    //atualiza o estado do processo
+    atual->estado = TERMINADO;
+
+    if (atual->contexto != NULL) {
+        free(atual->contexto);
+        atual->contexto = NULL;
+    }
+
+    /* Procura o próximo processo ativo no sistema */
+    PTR_DESC_PROC prox = proximo_ativo_depois(atual);
+
+    if (prox != NULL) {
+        PTR_DESC_PROC antigo = atual;
+        atual = prox;
+        transfer(antigo->contexto, atual->contexto);
+    } else {
+        /* Se não restarem processos ativos, devolve o controle com segurança para o main() */
+        printf("[NUCLEO] Todos os processos finalizaram. Retornando ao controle do Main.\n");
+        if (main_ready) {
+            transfer(atual->contexto, main_ctx);
+        } else {
+            fprintf(stderr, "ERRO CRITICO: Contexto base do Main inacessivel.\n");
+            exit(1);
+        }
+    }
 }
+
+
